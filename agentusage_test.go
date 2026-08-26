@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -144,8 +145,11 @@ func TestSnapshotMapsProvidersWithoutLeakingCredentials(t *testing.T) {
 	if got := claude.Windows[2]; got.Scope != "Fable" || got.UsedPercent != 35 {
 		t.Errorf("scoped window = %+v", got)
 	}
-	if !codex.FetchedAt.Equal(testNow) || !claude.FetchedAt.Equal(testNow) {
-		t.Errorf("provider fetched times = %s, %s", codex.FetchedAt, claude.FetchedAt)
+	if codex.FetchedAt == nil || !codex.FetchedAt.Equal(testNow) {
+		t.Errorf("Codex fetched_at = %v", codex.FetchedAt)
+	}
+	if claude.FetchedAt == nil || !claude.FetchedAt.Equal(testNow) {
+		t.Errorf("Claude fetched_at = %v", claude.FetchedAt)
 	}
 
 	raw, err := json.Marshal(snapshot)
@@ -163,15 +167,86 @@ func TestSnapshotCachesAndReturnsCopies(t *testing.T) {
 	})
 	first := fetcher.Snapshot(context.Background())
 	first.Providers[0].Windows[0].UsedPercent = 99
+	*first.Providers[0].Windows[0].ResetsAt = testNow.Add(48 * time.Hour)
 	second := fetcher.Snapshot(context.Background())
 	if second.Providers[0].Windows[0].UsedPercent != 12.5 {
 		t.Fatalf("caller mutated cache: %+v", second.Providers[0].Windows[0])
+	}
+	if second.Providers[0].Windows[0].ResetsAt.Equal(testNow.Add(48 * time.Hour)) {
+		t.Fatal("caller mutated cached reset time through a shared pointer")
 	}
 	if got := requests.Load(); got != 1 {
 		t.Fatalf("Claude requests = %d, want 1", got)
 	}
 	if got := codexStarts.Load(); got != 1 {
 		t.Fatalf("Codex app-server starts = %d, want 1", got)
+	}
+}
+
+func TestSnapshotExpiresCacheWithClock(t *testing.T) {
+	fetcher, requests, codexStarts := testFetcher(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":8,"resets_at":"2026-08-05T19:40:00Z"}}`))
+	})
+	current := testNow
+	fetcher.now = func() time.Time { return current }
+
+	fetcher.Snapshot(context.Background())
+	current = current.Add(defaultCacheTTL - time.Second)
+	fetcher.Snapshot(context.Background())
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("requests before expiry = %d, want 1", got)
+	}
+	current = current.Add(2 * time.Second)
+	fetcher.Snapshot(context.Background())
+	if got := requests.Load(); got != 2 {
+		t.Fatalf("requests after expiry = %d, want 2", got)
+	}
+	if got := codexStarts.Load(); got != 2 {
+		t.Fatalf("Codex app-server starts = %d, want 2", got)
+	}
+}
+
+func TestSnapshotSharesOneRefreshAcrossConcurrentCallers(t *testing.T) {
+	release := make(chan struct{})
+	fetcher, requests, codexStarts := testFetcher(t, func(w http.ResponseWriter, _ *http.Request) {
+		<-release
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":8,"resets_at":"2026-08-05T19:40:00Z"}}`))
+	})
+	var group sync.WaitGroup
+	for range 5 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			fetcher.Snapshot(context.Background())
+		}()
+	}
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	group.Wait()
+	if got := requests.Load(); got != 1 {
+		t.Fatalf("Claude requests = %d, want 1 shared refresh", got)
+	}
+	if got := codexStarts.Load(); got != 1 {
+		t.Fatalf("Codex app-server starts = %d, want 1 shared refresh", got)
+	}
+}
+
+func TestSnapshotIgnoresCanceledCaller(t *testing.T) {
+	fetcher, _, _ := testFetcher(t, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":8,"resets_at":"2026-08-05T19:40:00Z"}}`))
+	})
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	fetcher.Snapshot(canceled)
+
+	snapshot := fetcher.Snapshot(context.Background())
+	if !snapshot.HasData() {
+		t.Fatalf("snapshot after a canceled caller = %+v", snapshot)
+	}
+	for _, provider := range snapshot.Providers {
+		if strings.Contains(provider.Error, "context canceled") {
+			t.Fatalf("cache holds a cancellation error: %+v", provider)
+		}
 	}
 }
 
@@ -184,19 +259,46 @@ func TestSnapshotKeepsLastGoodProviderOnRefreshError(t *testing.T) {
 		}
 		_, _ = w.Write([]byte(`{"five_hour":{"utilization":8,"resets_at":"2026-08-05T19:40:00Z"}}`))
 	})
+	current := testNow
+	fetcher.now = func() time.Time { return current }
+
 	first := fetcher.Snapshot(context.Background())
 	if first.Providers[1].Stale {
 		t.Fatal("first Claude snapshot is stale")
 	}
 	failClaude = true
-	fetcher.cachedAt = time.Time{}
+	current = current.Add(defaultCacheTTL + time.Second)
 	second := fetcher.Snapshot(context.Background())
 	claude := second.Providers[1]
 	if !claude.Stale || len(claude.Windows) != 1 || !strings.Contains(claude.Error, "HTTP 429") {
 		t.Fatalf("stale Claude = %+v", claude)
 	}
-	if !claude.FetchedAt.Equal(testNow) {
-		t.Errorf("stale fetched_at changed: %s", claude.FetchedAt)
+	if claude.FetchedAt == nil || !claude.FetchedAt.Equal(testNow) {
+		t.Errorf("stale fetched_at = %v, want the first fetch time %s", claude.FetchedAt, testNow)
+	}
+}
+
+func TestSnapshotEmitsEmptyWindowsForFailedProvider(t *testing.T) {
+	fetcher, _, _ := testFetcher(t, func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "boom", http.StatusInternalServerError)
+	})
+	snapshot := fetcher.Snapshot(context.Background())
+	claude := snapshot.Providers[1]
+	if claude.Error == "" || claude.Stale {
+		t.Fatalf("failed Claude = %+v", claude)
+	}
+	if claude.FetchedAt != nil {
+		t.Fatalf("failed Claude has fetched_at = %v", claude.FetchedAt)
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"windows":[]`) {
+		t.Fatalf("failed provider windows are not an empty array: %s", raw)
+	}
+	if strings.Contains(string(raw), "0001-01-01") {
+		t.Fatalf("zero fetched_at leaked into JSON: %s", raw)
 	}
 }
 
@@ -207,11 +309,14 @@ func TestSnapshotHonorsRetryAfter(t *testing.T) {
 		w.Header().Set("Retry-After", "1800")
 		http.Error(w, "limited", http.StatusTooManyRequests)
 	})
+	current := testNow
+	fetcher.now = func() time.Time { return current }
+
 	first := fetcher.Snapshot(context.Background())
 	if !strings.Contains(first.Providers[1].Error, "HTTP 429") {
 		t.Fatalf("first Claude error = %q", first.Providers[1].Error)
 	}
-	fetcher.cachedAt = time.Time{}
+	current = current.Add(defaultCacheTTL + time.Second)
 	second := fetcher.Snapshot(context.Background())
 	if got := claudeRequests.Load(); got != 1 {
 		t.Fatalf("Claude requests = %d, want retry suppression", got)
@@ -266,12 +371,12 @@ func TestClaudeRefreshesExpiredTokenAndPersistsKeychainRotation(t *testing.T) {
 		return nil, nil
 	}
 
-	provider, err := fetcher.fetchClaude(context.Background())
+	windows, err := fetcher.fetchClaude(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(provider.Windows) != 1 {
-		t.Fatalf("Claude windows = %+v", provider.Windows)
+	if len(windows) != 1 {
+		t.Fatalf("Claude windows = %+v", windows)
 	}
 	auth, err := parseClaudeCredentials(stored)
 	if err != nil {
@@ -280,8 +385,55 @@ func TestClaudeRefreshesExpiredTokenAndPersistsKeychainRotation(t *testing.T) {
 	if auth.AccessToken != "new-access" || auth.RefreshToken != "new-refresh" {
 		t.Fatalf("persisted tokens = access %q refresh %q", auth.AccessToken, auth.RefreshToken)
 	}
-	if got := string(auth.oauth["subscriptionType"]); got != `"max"` {
+	var persisted struct {
+		OAuth map[string]json.RawMessage `json:"claudeAiOauth"`
+	}
+	if err := json.Unmarshal(stored, &persisted); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(persisted.OAuth["subscriptionType"]); got != `"max"` {
 		t.Errorf("subscriptionType = %s", got)
+	}
+}
+
+func TestClaudeRetriesRejectedTokenOnce(t *testing.T) {
+	var usageCalls, tokenCalls atomic.Int32
+	fetcher, _, _ := testFetcher(t, func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/claude":
+			usageCalls.Add(1)
+			if request.Header.Get("Authorization") == "Bearer revoked-access" {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			if got := request.Header.Get("Authorization"); got != "Bearer new-access" {
+				t.Errorf("Claude Authorization = %q", got)
+			}
+			_, _ = w.Write([]byte(`{"five_hour":{"utilization":8,"resets_at":"2026-08-05T19:40:00Z"}}`))
+		case "/token":
+			tokenCalls.Add(1)
+			_, _ = w.Write([]byte(`{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`))
+		default:
+			http.NotFound(w, request)
+		}
+	})
+	credentials := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"revoked-access","refreshToken":"old-refresh","expiresAt":%d}}`, testNow.Add(time.Hour).UnixMilli())
+	fetcher.run = func(context.Context, []byte, string, ...string) ([]byte, error) {
+		return []byte(credentials), nil
+	}
+
+	windows, err := fetcher.fetchClaude(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(windows) != 1 {
+		t.Fatalf("Claude windows = %+v", windows)
+	}
+	if got := usageCalls.Load(); got != 2 {
+		t.Fatalf("usage calls = %d, want one 401 and one retry", got)
+	}
+	if got := tokenCalls.Load(); got != 1 {
+		t.Fatalf("token calls = %d, want 1", got)
 	}
 }
 
@@ -342,7 +494,7 @@ func TestClaudeRefreshPersistsPrivateCredentialFile(t *testing.T) {
 		return nil, nil
 	}
 
-	token, err := fetcher.claudeToken(context.Background(), false, "")
+	token, err := fetcher.claudeToken(context.Background(), "")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -355,6 +507,21 @@ func TestClaudeRefreshPersistsPrivateCredentialFile(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Errorf("credential mode = %o", got)
+	}
+	persistedRaw, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := parseClaudeCredentials(persistedRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if persisted.AccessToken != "new-access" {
+		t.Errorf("persisted access token = %q", persisted.AccessToken)
+	}
+	// The token endpoint sent no refresh_token, so the old one must survive.
+	if persisted.RefreshToken != "old-refresh" {
+		t.Errorf("persisted refresh token = %q, want the old token kept", persisted.RefreshToken)
 	}
 }
 
@@ -392,5 +559,24 @@ func TestHelpersClampAndParseProviderData(t *testing.T) {
 	}
 	if got := parseRetryAfter("120", testNow); got != 2*time.Minute {
 		t.Errorf("retry after = %s", got)
+	}
+	if got := parseRetryAfter("99999999999", testNow); got != maxRetryAfter {
+		t.Errorf("capped retry after = %s", got)
+	}
+}
+
+func TestClaudeScopedLimitSupersedesLegacyWeeklyField(t *testing.T) {
+	windows := claudeWindows(claudeUsage{
+		SevenDaySonnet: &claudeUsageWindow{Utilization: 12},
+		Limits: []claudeLimit{{
+			Kind: "weekly_scoped", Percent: 34,
+			Scope: &claudeScope{Model: &claudeModel{DisplayName: "Claude Sonnet 4.5"}},
+		}},
+	})
+	if len(windows) != 1 {
+		t.Fatalf("windows = %+v, want one deduplicated Sonnet window", windows)
+	}
+	if windows[0].ID != "weekly-claude-sonnet-4-5" || windows[0].UsedPercent != 34 {
+		t.Fatalf("window = %+v", windows[0])
 	}
 }

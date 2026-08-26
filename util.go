@@ -11,7 +11,12 @@ import (
 	"unicode"
 )
 
-const maxResponse = 1 << 20
+const (
+	maxResponse = 1 << 20
+	// maxRetryAfter caps a server Retry-After value. The cap protects against
+	// an absurd or overflowed backoff that would block a provider forever.
+	maxRetryAfter = 24 * time.Hour
+)
 
 func (f *Fetcher) fetchJSON(request *http.Request, destination any) error {
 	response, err := f.client.Do(request)
@@ -44,11 +49,14 @@ func (err *httpStatusError) Error() string {
 }
 
 func parseRetryAfter(value string, now time.Time) time.Duration {
-	if seconds, err := strconv.Atoi(strings.TrimSpace(value)); err == nil && seconds > 0 {
+	if seconds, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err == nil && seconds > 0 {
+		if seconds > int64(maxRetryAfter/time.Second) {
+			return maxRetryAfter
+		}
 		return time.Duration(seconds) * time.Second
 	}
 	if at, err := http.ParseTime(value); err == nil && at.After(now) {
-		return at.Sub(now)
+		return min(at.Sub(now), maxRetryAfter)
 	}
 	return 0
 }
@@ -58,10 +66,7 @@ func retryBlocked(until, now time.Time) error {
 }
 
 func windowLabel(seconds int64) string {
-	switch seconds {
-	case 5 * 60 * 60:
-		return "5h window"
-	case 7 * 24 * 60 * 60:
+	if seconds == weekSeconds {
 		return "1w window"
 	}
 	if seconds%(24*60*60) == 0 {

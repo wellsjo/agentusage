@@ -3,6 +3,7 @@ package web
 import (
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -18,6 +19,35 @@ func TestHandlerServesComponentModule(t *testing.T) {
 	}
 	if body := response.Body.String(); !strings.Contains(body, `customElements.define("agent-usage"`) {
 		t.Fatal("response does not register agent-usage")
+	}
+}
+
+func TestHandlerSupportsRevalidationAndHead(t *testing.T) {
+	first := httptest.NewRecorder()
+	Handler().ServeHTTP(first, httptest.NewRequest(http.MethodGet, "/agent-usage.js", nil))
+	etag := first.Header().Get("ETag")
+	if etag == "" {
+		t.Fatal("response has no ETag")
+	}
+	if got := first.Header().Get("Content-Length"); got != strconv.Itoa(first.Body.Len()) {
+		t.Errorf("Content-Length = %q, body = %d bytes", got, first.Body.Len())
+	}
+
+	conditional := httptest.NewRequest(http.MethodGet, "/agent-usage.js", nil)
+	conditional.Header.Set("If-None-Match", etag)
+	second := httptest.NewRecorder()
+	Handler().ServeHTTP(second, conditional)
+	if second.Code != http.StatusNotModified {
+		t.Fatalf("conditional status = %d, want 304", second.Code)
+	}
+
+	head := httptest.NewRecorder()
+	Handler().ServeHTTP(head, httptest.NewRequest(http.MethodHead, "/agent-usage.js", nil))
+	if head.Code != http.StatusOK || head.Body.Len() != 0 {
+		t.Fatalf("HEAD = %d with %d body bytes", head.Code, head.Body.Len())
+	}
+	if head.Header().Get("Content-Length") == "" {
+		t.Error("HEAD response has no Content-Length")
 	}
 }
 

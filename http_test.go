@@ -45,3 +45,23 @@ func TestHandlerRejectsWrites(t *testing.T) {
 		t.Fatalf("status = %d", response.Code)
 	}
 }
+
+func TestHandlerSupportsHead(t *testing.T) {
+	response := httptest.NewRecorder()
+	Handler(staticSource{}).ServeHTTP(response, httptest.NewRequest(http.MethodHead, "/ai/usage", nil))
+	if response.Code != http.StatusOK {
+		t.Fatalf("status = %d", response.Code)
+	}
+	if response.Body.Len() != 0 {
+		t.Fatalf("HEAD body = %q", response.Body.String())
+	}
+}
+
+func TestHandlerRejectsTypedNilSource(t *testing.T) {
+	var missing *Fetcher
+	response := httptest.NewRecorder()
+	Handler(missing).ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/ai/usage", nil))
+	if response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 for a typed nil Source", response.Code)
+	}
+}

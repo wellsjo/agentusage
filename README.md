@@ -1,10 +1,10 @@
 # agentusage
 
-`agentusage` reads local Codex and Claude Code account limits. It provides a
+`agentusage` reads local Codex and Claude Code account limits. It gives a
 normalized Go API, an HTTP handler, and a framework-agnostic Web Component.
 
 The module has no third-party dependencies. Credentials stay inside the Go
-package and never enter the JSON response or browser component.
+package. They never enter the JSON response or the browser component.
 
 ## Go
 
@@ -15,16 +15,23 @@ usage := agentusage.New()
 snapshot := usage.Snapshot(ctx)
 
 // Or expose the normalized JSON contract.
-mux.Handle("GET /ai/usage", agentusage.Handler(usage))
+mux.Handle("/ai/usage", agentusage.Handler(usage))
 
 // Serve the optional browser component from the same binary.
-mux.Handle("GET /assets/agent-usage.js", agentusageweb.Handler())
+mux.Handle("/assets/agent-usage.js", agentusageweb.Handler())
 ```
+
+The fetcher caches a snapshot for two minutes. Concurrent calls share one
+refresh, and the refresh runs on a detached context with its own timeout. So
+a canceled request cannot block or poison other callers. A snapshot with no
+data at all expires after 15 seconds, so the module recovers quickly from a
+start-up failure. The module honors `Retry-After` on HTTP 429, with a cap of
+24 hours.
 
 ## Browser
 
-The component is a standards-based custom element. It does not require React,
-a bundler, or an npm package.
+The component is a standards-based custom element. It does not need React, a
+bundler, or an npm package.
 
 ```html
 <script type="module" src="/assets/agent-usage.js"></script>
@@ -32,14 +39,26 @@ a bundler, or an npm package.
 <agent-usage endpoint="/ai/usage" refresh-ms="120000"></agent-usage>
 ```
 
-Applications can also supply data without an HTTP request:
+Attributes:
+
+- `endpoint` — the JSON endpoint. The default is `/ai/usage`. An empty value
+  turns the fetch off.
+- `refresh-ms` — the poll interval in milliseconds. The default is `120000`,
+  and the minimum is `10000`. A value of `0` turns the poll off. An invalid
+  value falls back to the default.
+
+The component pauses its poll while the tab is hidden. It polls once when the
+tab becomes visible again.
+
+Applications can also supply data without an HTTP request. This stops the
+automatic poll, so a fetch cannot overwrite the given data:
 
 ```js
 document.querySelector("agent-usage").snapshot = snapshot;
 ```
 
 The Shadow DOM protects the component from application CSS. CSS custom
-properties provide theme control:
+properties give theme control:
 
 ```css
 agent-usage {
@@ -55,9 +74,11 @@ agent-usage {
 ## Providers
 
 - Codex uses `codex app-server`. The first-party CLI owns its authentication
-  and token refresh.
-- Claude Code reads its credential file or macOS Keychain item. It refreshes
-  OAuth tokens before expiry, retries HTTP 401 once, and persists rotations.
+  and its token refresh.
+- Claude Code reads its credential file or its macOS Keychain item. It
+  refreshes OAuth tokens before expiry, retries HTTP 401 once, and persists
+  rotations. When a save fails, the module keeps the rotated credential in
+  memory and tries the save again on the next poll.
 
 ## JSON contract
 
@@ -83,5 +104,6 @@ agent-usage {
 }
 ```
 
-Failed refreshes retain the last good provider values with `stale: true` and a
-sanitized `error` string.
+`windows` is always an array. `fetched_at` appears only after one successful
+fetch for that provider. A failed refresh keeps the last good provider values
+with `stale: true` and a sanitized `error` string.

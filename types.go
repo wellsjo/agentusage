@@ -7,6 +7,7 @@ package agentusage
 
 import (
 	"context"
+	"slices"
 	"time"
 )
 
@@ -20,14 +21,15 @@ type Window struct {
 	ResetsAt      *time.Time `json:"resets_at,omitempty"`
 }
 
-// Provider is one AI account and its available quota windows.
+// Provider is one AI account and its available quota windows. FetchedAt is
+// nil until one fetch for this provider succeeds.
 type Provider struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Windows   []Window  `json:"windows"`
-	FetchedAt time.Time `json:"fetched_at,omitempty"`
-	Stale     bool      `json:"stale,omitempty"`
-	Error     string    `json:"error,omitempty"`
+	ID        string     `json:"id"`
+	Name      string     `json:"name"`
+	Windows   []Window   `json:"windows"`
+	FetchedAt *time.Time `json:"fetched_at,omitempty"`
+	Stale     bool       `json:"stale,omitempty"`
+	Error     string     `json:"error,omitempty"`
 }
 
 // Snapshot is the normalized response shared by Go and browser consumers.
@@ -51,12 +53,25 @@ func (s Snapshot) HasData() bool {
 	return false
 }
 
+// cloneSnapshot copies every slice and every shared pointer, so a caller can
+// change the result without an effect on the cache. It keeps an empty (not
+// nil) Windows slice empty, so the JSON stays "windows": [].
 func cloneSnapshot(snapshot Snapshot) Snapshot {
 	clone := snapshot
-	clone.Providers = make([]Provider, len(snapshot.Providers))
-	for i, provider := range snapshot.Providers {
-		clone.Providers[i] = provider
-		clone.Providers[i].Windows = append([]Window(nil), provider.Windows...)
+	clone.Providers = slices.Clone(snapshot.Providers)
+	for i := range clone.Providers {
+		provider := &clone.Providers[i]
+		if provider.FetchedAt != nil {
+			fetchedAt := *provider.FetchedAt
+			provider.FetchedAt = &fetchedAt
+		}
+		provider.Windows = slices.Clone(provider.Windows)
+		for j := range provider.Windows {
+			if provider.Windows[j].ResetsAt != nil {
+				resetsAt := *provider.Windows[j].ResetsAt
+				provider.Windows[j].ResetsAt = &resetsAt
+			}
+		}
 	}
 	return clone
 }

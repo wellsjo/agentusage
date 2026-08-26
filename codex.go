@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"sort"
 	"time"
 )
@@ -41,11 +40,10 @@ type rpcError struct {
 	Message string `json:"message"`
 }
 
-func (f *Fetcher) fetchCodex(ctx context.Context) (Provider, error) {
-	provider := Provider{ID: "codex", Name: "Codex"}
+func (f *Fetcher) fetchCodex(ctx context.Context) ([]Window, error) {
 	result, err := f.readCodexRateLimits(ctx)
 	if err != nil {
-		return provider, err
+		return nil, err
 	}
 
 	rateLimit := result.RateLimits
@@ -53,40 +51,39 @@ func (f *Fetcher) fetchCodex(ctx context.Context) (Provider, error) {
 		rateLimit = result.RateLimitsByLimitID["codex"]
 	}
 	if rateLimit == nil {
-		return provider, fmt.Errorf("Codex returned no rate-limit bucket")
+		return nil, fmt.Errorf("Codex returned no rate-limit bucket")
 	}
-	for id, window := range map[string]*codexRateLimitWindow{
-		"primary": rateLimit.Primary, "secondary": rateLimit.Secondary,
+	var windows []Window
+	for _, entry := range []struct {
+		id     string
+		window *codexRateLimitWindow
+	}{
+		{"primary", rateLimit.Primary},
+		{"secondary", rateLimit.Secondary},
 	} {
-		if window == nil || window.WindowDurationMin <= 0 {
+		if entry.window == nil || entry.window.WindowDurationMin <= 0 {
 			continue
 		}
-		seconds := window.WindowDurationMin * 60
-		provider.Windows = append(provider.Windows, Window{
-			ID:            id,
+		seconds := entry.window.WindowDurationMin * 60
+		windows = append(windows, Window{
+			ID:            entry.id,
 			Label:         windowLabel(seconds),
-			UsedPercent:   clampPercent(window.UsedPercent),
+			UsedPercent:   clampPercent(entry.window.UsedPercent),
 			WindowSeconds: seconds,
-			ResetsAt:      unixTime(window.ResetsAt),
+			ResetsAt:      unixTime(entry.window.ResetsAt),
 		})
 	}
-	sort.Slice(provider.Windows, func(i, j int) bool {
-		return provider.Windows[i].WindowSeconds < provider.Windows[j].WindowSeconds
+	sort.SliceStable(windows, func(i, j int) bool {
+		return windows[i].WindowSeconds < windows[j].WindowSeconds
 	})
-	if len(provider.Windows) == 0 {
-		return provider, fmt.Errorf("Codex returned no usage windows")
+	if len(windows) == 0 {
+		return nil, fmt.Errorf("Codex returned no usage windows")
 	}
-	return provider, nil
+	return windows, nil
 }
 
 func (f *Fetcher) readCodexRateLimits(ctx context.Context) (codexRateLimitResult, error) {
-	ctx, cancel := context.WithTimeout(ctx, f.requestTimeout)
-	defer cancel()
-
-	command := exec.CommandContext(ctx, f.codexCommand, "app-server")
-	if f.startCodex != nil {
-		command = f.startCodex(ctx)
-	}
+	command := f.startCodex(ctx)
 	if f.codexHome != "" {
 		environment := command.Env
 		if environment == nil {

@@ -101,6 +101,11 @@ export class AgentUsage extends HTMLElement {
     this._controller = null;
     this._refreshTimer = null;
     this._clockTimer = null;
+    this._connected = false;
+    this._manual = false;
+    this._restartQueued = false;
+    this._refreshWhenVisible = false;
+    this._onVisibilityChange = () => this._handleVisibilityChange();
     const shadow = this.attachShadow({ mode: "open" });
     const style = document.createElement("style");
     style.textContent = STYLES;
@@ -111,32 +116,63 @@ export class AgentUsage extends HTMLElement {
   }
 
   connectedCallback() {
+    this._connected = true;
+    document.addEventListener("visibilitychange", this._onVisibilityChange);
     this._render();
     this._startTimers();
-    if (this.endpoint) this.refresh();
+    if (this.endpoint && !this._manual) this.refresh();
   }
 
   disconnectedCallback() {
+    this._connected = false;
+    document.removeEventListener("visibilitychange", this._onVisibilityChange);
     this._stopTimers();
     this._controller?.abort();
     this._controller = null;
   }
 
+  // A guard on the internal connected flag skips the callbacks that run
+  // during a custom-element upgrade, before connectedCallback. The microtask
+  // queue merges several attribute changes into one restart and one fetch.
   attributeChangedCallback() {
-    if (!this.isConnected) return;
-    this._startTimers();
-    if (this.endpoint) this.refresh();
+    this._manual = false;
+    this._scheduleRestart();
   }
 
   get endpoint() {
     return this.hasAttribute("endpoint") ? this.getAttribute("endpoint") : "/ai/usage";
   }
 
+  set endpoint(value) {
+    if (value === null || value === undefined) this.removeAttribute("endpoint");
+    else this.setAttribute("endpoint", String(value));
+  }
+
+  // refreshMs returns the poll interval. An absent, empty, or invalid
+  // attribute falls back to the default; 0 turns the poll off.
+  get refreshMs() {
+    const raw = this.getAttribute("refresh-ms");
+    if (raw === null || raw.trim() === "") return 120000;
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= 0 ? value : 120000;
+  }
+
+  set refreshMs(value) {
+    this.setAttribute("refresh-ms", String(value));
+  }
+
   get snapshot() {
     return this._snapshot;
   }
 
+  // The snapshot setter puts the element in manual data mode: it stops the
+  // automatic poll, so a later fetch cannot overwrite the given data. A
+  // change to an observed attribute starts the poll again.
   set snapshot(value) {
+    this._manual = true;
+    this._controller?.abort();
+    this._controller = null;
+    this._stopRefreshTimer();
     this._snapshot = value && typeof value === "object" ? value : null;
     this._error = "";
     this._render();
@@ -178,18 +214,54 @@ export class AgentUsage extends HTMLElement {
 
   _startTimers() {
     this._stopTimers();
-    const refreshMs = Number(this.getAttribute("refresh-ms") ?? 120000);
-    if (Number.isFinite(refreshMs) && refreshMs > 0 && this.endpoint) {
-      this._refreshTimer = setInterval(() => this.refresh(), Math.max(10000, refreshMs));
+    const refreshMs = this.refreshMs;
+    if (refreshMs > 0 && this.endpoint && !this._manual) {
+      this._refreshTimer = setInterval(() => this._timedRefresh(), Math.max(10000, refreshMs));
     }
-    this._clockTimer = setInterval(() => this._updateTimes(), 15000);
+    this._clockTimer = setInterval(() => {
+      if (!document.hidden) this._render();
+    }, 15000);
+  }
+
+  _stopRefreshTimer() {
+    clearInterval(this._refreshTimer);
+    this._refreshTimer = null;
   }
 
   _stopTimers() {
-    clearInterval(this._refreshTimer);
+    this._stopRefreshTimer();
     clearInterval(this._clockTimer);
-    this._refreshTimer = null;
     this._clockTimer = null;
+  }
+
+  // A hidden tab defers the poll. The visibilitychange handler runs the
+  // deferred poll when the tab becomes visible again.
+  _timedRefresh() {
+    if (document.hidden) {
+      this._refreshWhenVisible = true;
+      return;
+    }
+    this.refresh();
+  }
+
+  _handleVisibilityChange() {
+    if (document.hidden) return;
+    this._render();
+    if (this._refreshWhenVisible) {
+      this._refreshWhenVisible = false;
+      this.refresh();
+    }
+  }
+
+  _scheduleRestart() {
+    if (this._restartQueued) return;
+    this._restartQueued = true;
+    queueMicrotask(() => {
+      this._restartQueued = false;
+      if (!this._connected) return;
+      this._startTimers();
+      if (this.endpoint && !this._manual) this.refresh();
+    });
   }
 
   _render() {
@@ -211,7 +283,6 @@ export class AgentUsage extends HTMLElement {
       status.textContent = this._error;
       this._root.append(status);
     }
-    this._updateTimes();
   }
 
   _providerView(provider) {
@@ -240,7 +311,7 @@ export class AgentUsage extends HTMLElement {
     return section;
   }
 
-  _windowView(window) {
+  _windowView(usageWindow) {
     const item = document.createElement("div");
     item.className = "window";
     item.setAttribute("part", "window");
@@ -250,14 +321,13 @@ export class AgentUsage extends HTMLElement {
     const description = document.createElement("span");
     description.className = "description";
     const label = document.createElement("span");
-    label.textContent = `${window?.label || "Usage"}${window?.scope ? ` · ${window.scope}` : ""}`;
+    label.textContent = `${usageWindow?.label || "Usage"}${usageWindow?.scope ? ` · ${usageWindow.scope}` : ""}`;
     const reset = document.createElement("span");
     reset.className = "reset";
-    reset.dataset.resetsAt = window?.resets_at || "";
-    reset.textContent = resetText(window?.resets_at);
+    reset.textContent = resetText(usageWindow?.resets_at);
     const used = document.createElement("span");
     used.className = "used";
-    used.textContent = `${formatPercent(window?.used_percent)} used`;
+    used.textContent = `${formatPercent(usageWindow?.used_percent)} used`;
     description.append(label, reset);
     meta.append(description, used);
 
@@ -267,40 +337,25 @@ export class AgentUsage extends HTMLElement {
     track.setAttribute("role", "progressbar");
     track.setAttribute("aria-valuemin", "0");
     track.setAttribute("aria-valuemax", "100");
-    track.setAttribute("aria-valuenow", String(clamp(window?.used_percent)));
-    track.setAttribute("aria-label", `${window?.label || "Usage"} used`);
+    track.setAttribute("aria-valuenow", String(clamp(usageWindow?.used_percent)));
+    track.setAttribute("aria-label", `${usageWindow?.label || "Usage"} used`);
     const fill = document.createElement("span");
     fill.className = "fill";
     fill.setAttribute("part", "fill");
-    fill.style.width = `${clamp(window?.used_percent)}%`;
+    fill.style.width = `${clamp(usageWindow?.used_percent)}%`;
     const marker = document.createElement("span");
     marker.className = "marker";
     marker.setAttribute("aria-hidden", "true");
-    marker.dataset.resetsAt = window?.resets_at || "";
-    marker.dataset.windowSeconds = window?.window_seconds || "";
-    marker.style.left = `${elapsedPercent(window)}%`;
+    marker.style.left = `${elapsedPercent(usageWindow)}%`;
     track.append(fill, marker);
     item.append(meta, track);
     return item;
   }
-
-  _updateTimes() {
-    if (!this._root) return;
-    this._root.querySelectorAll(".reset").forEach((element) => {
-      element.textContent = resetText(element.dataset.resetsAt);
-    });
-    this._root.querySelectorAll(".marker").forEach((element) => {
-      element.style.left = `${elapsedPercent({
-        resets_at: element.dataset.resetsAt,
-        window_seconds: Number(element.dataset.windowSeconds),
-      })}%`;
-    });
-  }
 }
 
 function iconView(id) {
+  if (!Object.hasOwn(ICON_PATHS, id ?? "")) return null;
   const pathValue = ICON_PATHS[id];
-  if (!pathValue) return null;
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
   svg.classList.add("icon");
   svg.setAttribute("part", "icon");
