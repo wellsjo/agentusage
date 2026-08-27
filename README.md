@@ -1,5 +1,8 @@
 # agentusage
 
+<img width="1716" height="245" alt="image" src="https://github.com/user-attachments/assets/da1caa9e-89b0-4ebb-899b-c0e3c8e6c12c" />  
+
+
 `agentusage` reads local Codex and Claude Code account limits. It gives a
 normalized Go API, an HTTP handler, and a framework-agnostic Web Component.
 
