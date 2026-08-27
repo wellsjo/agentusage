@@ -10,8 +10,10 @@ for planning.
 It reads local Codex and Claude Code account limits. It gives a
 normalized Go API, an HTTP handler, and a framework-agnostic Web Component. 
 
-The module has no third-party dependencies. Credentials stay inside the Go
-package. They never enter the JSON response or the browser component.
+The core package has no third-party dependencies; the optional `png` package
+depends on `golang.org/x/image` for text and vector rasterization. Credentials
+stay inside the Go package. They never enter the JSON response, the browser
+component, or the PNG.
 
 ## Go
 
@@ -88,6 +90,46 @@ agent-usage {
   --agentusage-icon-claude: #d97757;
 }
 ```
+
+## PNG
+
+The optional `png` package renders a snapshot to an image with the same
+layout and dark palette as the Web Component. It uses no HTML and no browser,
+so it suits a chat bot or a scheduled report that runs outside a web page.
+
+```go
+import agentusagepng "github.com/wellsjo/agentusage/png"
+
+snapshot := usage.Snapshot(ctx)
+
+var buffer bytes.Buffer
+if err := agentusagepng.Encode(&buffer, snapshot, agentusagepng.Options{}); err != nil {
+    return err
+}
+```
+
+`Render` returns the `*image.RGBA` instead of PNG bytes. Zero `Options`
+values use the defaults:
+
+- `Width` — the image width in CSS pixels, padding included. The default is
+  `720`.
+- `Scale` — the device pixel ratio. The default is `2`, so the default image
+  is 1440 pixels wide.
+- `Padding` — the space around the component in CSS pixels. The default is
+  `16`; a negative value removes it.
+- `Columns` — the provider columns. The default is `2`. A component 540 CSS
+  pixels wide or narrower uses one column, like the browser component.
+- `Now` — the reference time for "resets in" and the elapsed-time marker.
+  The default is `time.Now()`.
+- `Theme` — the colors. The default is `Dark`; `Light` matches the
+  component's default palette.
+- `Font`, `HeadingFont` — TrueType or OpenType data. The default is the Go
+  fonts that ship with `golang.org/x/image`. Supply a system font for a
+  closer match to a browser screenshot.
+
+The package keeps to rendering. Delivery — a Slack post, a schedule — belongs
+in the application. Golden images in `png/testdata` pin the output;
+`go test ./png -update` regenerates them after an intended change.
 
 ## Providers
 
