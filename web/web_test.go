@@ -58,3 +58,16 @@ func TestScriptReturnsCopy(t *testing.T) {
 		t.Fatal("Script returned shared mutable storage")
 	}
 }
+
+func TestScriptIncludesProviderIconThemes(t *testing.T) {
+	script := string(Script())
+	for _, marker := range []string{
+		`--agentusage-icon-codex: var(--agentusage-muted)`,
+		`--agentusage-icon-claude: #d97757`,
+		"svg.classList.add(\"icon\", `icon--${id}`)",
+	} {
+		if !strings.Contains(script, marker) {
+			t.Errorf("component is missing %q", marker)
+		}
+	}
+}
