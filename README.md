@@ -4,7 +4,8 @@
 
 
 `agentusage` is a go-based web component that displays your token usage 
-relative to the amount of time left in the window. it's useful for planning. 
+relative to the amount of time left in the billing window. it's useful 
+for planning. 
 
 It reads local Codex and Claude Code account limits. It gives a
 normalized Go API, an HTTP handler, and a framework-agnostic Web Component. 
