@@ -131,15 +131,17 @@ func TestSnapshotMapsProvidersWithoutLeakingCredentials(t *testing.T) {
 	if len(snapshot.Providers) != 2 {
 		t.Fatalf("providers = %d, want 2", len(snapshot.Providers))
 	}
-	codex := snapshot.Providers[0]
-	if codex.ID != "codex" || codex.Error != "" || len(codex.Windows) != 2 {
+	codex, ok := snapshot.Provider(ProviderIDCodex)
+	if !ok || codex.Error != "" || len(codex.Windows) != 2 {
 		t.Fatalf("Codex = %+v", codex)
 	}
-	if codex.Windows[0].Label != "5h window" || codex.Windows[1].Label != "1w window" {
+	primary, primaryOK := codex.Window(CodexWindowIDPrimary)
+	secondary, secondaryOK := codex.Window(CodexWindowIDSecondary)
+	if !primaryOK || !secondaryOK || primary.Label != "5h window" || secondary.Label != "1w window" {
 		t.Errorf("Codex windows = %+v", codex.Windows)
 	}
-	claude := snapshot.Providers[1]
-	if claude.ID != "claude" || claude.Error != "" || len(claude.Windows) != 3 {
+	claude, ok := snapshot.Provider(ProviderIDClaude)
+	if !ok || claude.Error != "" || len(claude.Windows) != 3 {
 		t.Fatalf("Claude = %+v", claude)
 	}
 	if got := claude.Windows[2]; got.Scope != "Fable" || got.UsedPercent != 35 {

@@ -48,7 +48,7 @@ func (f *Fetcher) fetchCodex(ctx context.Context) ([]Window, error) {
 
 	rateLimit := result.RateLimits
 	if rateLimit == nil {
-		rateLimit = result.RateLimitsByLimitID["codex"]
+		rateLimit = result.RateLimitsByLimitID[ProviderIDCodex]
 	}
 	if rateLimit == nil {
 		return nil, fmt.Errorf("Codex returned no rate-limit bucket")
@@ -58,8 +58,8 @@ func (f *Fetcher) fetchCodex(ctx context.Context) ([]Window, error) {
 		id     string
 		window *codexRateLimitWindow
 	}{
-		{"primary", rateLimit.Primary},
-		{"secondary", rateLimit.Secondary},
+		{CodexWindowIDPrimary, rateLimit.Primary},
+		{CodexWindowIDSecondary, rateLimit.Secondary},
 	} {
 		if entry.window == nil || entry.window.WindowDurationMin <= 0 {
 			continue

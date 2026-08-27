@@ -14,6 +14,15 @@ usage := agentusage.New()
 // Use the snapshot in application code.
 snapshot := usage.Snapshot(ctx)
 
+// Find normalized providers and windows by their stable IDs.
+codex, ok := snapshot.Provider(agentusage.ProviderIDCodex)
+if ok {
+    primary, ok := codex.Window(agentusage.CodexWindowIDPrimary)
+    if ok {
+        fmt.Printf("Codex primary window: %.1f%% used\n", primary.UsedPercent)
+    }
+}
+
 // Or expose the normalized JSON contract.
 mux.Handle("/ai/usage", agentusage.Handler(usage))
 
