@@ -3,8 +3,11 @@
 <img width="1716" height="245" alt="image" src="https://github.com/user-attachments/assets/da1caa9e-89b0-4ebb-899b-c0e3c8e6c12c" />  
 
 
-`agentusage` reads local Codex and Claude Code account limits. It gives a
-normalized Go API, an HTTP handler, and a framework-agnostic Web Component.
+`agentusage` is a go-based web component that displays your token usage 
+relative to the amount of time left in the window. it's useful for planning. 
+
+It reads local Codex and Claude Code account limits. It gives a
+normalized Go API, an HTTP handler, and a framework-agnostic Web Component. 
 
 The module has no third-party dependencies. Credentials stay inside the Go
 package. They never enter the JSON response or the browser component.
