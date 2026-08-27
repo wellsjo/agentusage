@@ -41,8 +41,8 @@ type providerSpec struct {
 }
 
 var providerSpecs = []providerSpec{
-	{id: "codex", name: "Codex", fetch: (*Fetcher).fetchCodex},
-	{id: "claude", name: "Claude Code", fetch: (*Fetcher).fetchClaude},
+	{id: ProviderIDCodex, name: "Codex", fetch: (*Fetcher).fetchCodex},
+	{id: ProviderIDClaude, name: "Claude Code", fetch: (*Fetcher).fetchClaude},
 }
 
 // Fetcher serializes and caches remote reads. One shared refresh serves all

@@ -11,6 +11,18 @@ import (
 	"time"
 )
 
+// Stable provider IDs used by Snapshot.Provider.
+const (
+	ProviderIDCodex  = "codex"
+	ProviderIDClaude = "claude"
+)
+
+// Stable Codex quota-window IDs used by Provider.Window.
+const (
+	CodexWindowIDPrimary   = "primary"
+	CodexWindowIDSecondary = "secondary"
+)
+
 // Window is one provider quota window.
 type Window struct {
 	ID            string     `json:"id"`
@@ -41,6 +53,26 @@ type Snapshot struct {
 // Source supplies usage snapshots.
 type Source interface {
 	Snapshot(context.Context) Snapshot
+}
+
+// Provider returns the provider with the requested stable ID.
+func (s Snapshot) Provider(id string) (Provider, bool) {
+	for _, provider := range s.Providers {
+		if provider.ID == id {
+			return provider, true
+		}
+	}
+	return Provider{}, false
+}
+
+// Window returns the quota window with the requested stable ID.
+func (p Provider) Window(id string) (Window, bool) {
+	for _, window := range p.Windows {
+		if window.ID == id {
+			return window, true
+		}
+	}
+	return Window{}, false
 }
 
 // HasData reports whether at least one provider has a quota window.
