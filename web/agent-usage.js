@@ -11,6 +11,8 @@ const STYLES = `
     --agentusage-text: #1f2328;
     --agentusage-muted: #59636e;
     --agentusage-danger: #cf222e;
+    --agentusage-icon-codex: var(--agentusage-muted);
+    --agentusage-icon-claude: #d97757;
     container-type: inline-size;
     display: block;
     color: var(--agentusage-text);
@@ -35,6 +37,8 @@ const STYLES = `
     text-transform: uppercase;
   }
   .icon { width: 14px; height: 14px; flex: 0 0 14px; fill: currentColor; }
+  .icon--codex { color: var(--agentusage-icon-codex); }
+  .icon--claude { color: var(--agentusage-icon-claude); }
   .window + .window { margin-top: 12px; }
   .meta {
     display: grid;
@@ -357,7 +361,7 @@ function iconView(id) {
   if (!Object.hasOwn(ICON_PATHS, id ?? "")) return null;
   const pathValue = ICON_PATHS[id];
   const svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
-  svg.classList.add("icon");
+  svg.classList.add("icon", `icon--${id}`);
   svg.setAttribute("part", "icon");
   svg.setAttribute("viewBox", "0 0 100 100");
   svg.setAttribute("aria-hidden", "true");

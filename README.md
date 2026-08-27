@@ -77,6 +77,8 @@ agent-usage {
   --agentusage-text: #1f2328;
   --agentusage-muted: #59636e;
   --agentusage-danger: #cf222e;
+  --agentusage-icon-codex: var(--agentusage-muted);
+  --agentusage-icon-claude: #d97757;
 }
 ```
 
