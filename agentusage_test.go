@@ -527,6 +527,213 @@ func TestClaudeRefreshPersistsPrivateCredentialFile(t *testing.T) {
 	}
 }
 
+// suppliedTokenFetcher builds a Fetcher in supplied-token mode. It fails the
+// test on any command run (so any Keychain access), and it points the home
+// directory at a credential file whose tokens must never be used.
+func suppliedTokenFetcher(t *testing.T, handler http.HandlerFunc) (*Fetcher, string) {
+	t.Helper()
+	fetcher, _, _ := testFetcher(t, handler)
+	fetcher.claudeSuppliedToken = "supplied-secret"
+	fetcher.run = func(_ context.Context, _ []byte, name string, args ...string) ([]byte, error) {
+		t.Errorf("supplied-token mode ran a command: %s %v", name, args)
+		return nil, fmt.Errorf("unexpected command")
+	}
+	credentialsDir := filepath.Join(fetcher.homeDir, ".claude")
+	if err := os.MkdirAll(credentialsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	credentialsPath := filepath.Join(credentialsDir, ".credentials.json")
+	stored := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"stored-secret","refreshToken":"stored-refresh","expiresAt":%d}}`, testNow.Add(-time.Hour).UnixMilli())
+	if err := os.WriteFile(credentialsPath, []byte(stored), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return fetcher, credentialsPath
+}
+
+func TestSuppliedTokenIsUsedWithoutCredentialStores(t *testing.T) {
+	var tokenCalls atomic.Int32
+	fetcher, credentialsPath := suppliedTokenFetcher(t, func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/claude":
+			if got := request.Header.Get("Authorization"); got != "Bearer supplied-secret" {
+				t.Errorf("Claude Authorization = %q", got)
+			}
+			_, _ = w.Write([]byte(`{"five_hour":{"utilization":8,"resets_at":"2026-08-05T19:40:00Z"}}`))
+		case "/token":
+			tokenCalls.Add(1)
+			http.Error(w, "unexpected refresh", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, request)
+		}
+	})
+	before, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := fetcher.Snapshot(context.Background())
+	claude, ok := snapshot.Provider(ProviderIDClaude)
+	if !ok || claude.Error != "" || len(claude.Windows) != 1 {
+		t.Fatalf("Claude = %+v", claude)
+	}
+	if got := tokenCalls.Load(); got != 0 {
+		t.Fatalf("token refresh calls = %d, want 0", got)
+	}
+	after, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("supplied-token mode rewrote the credential file: %s", after)
+	}
+	entries, err := os.ReadDir(filepath.Dir(credentialsPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("supplied-token mode wrote extra files: %v", entries)
+	}
+	if fetcher.claudeLoaded || fetcher.claudeDirty {
+		t.Fatalf("supplied-token mode loaded stored credentials: loaded=%v dirty=%v", fetcher.claudeLoaded, fetcher.claudeDirty)
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "secret") {
+		t.Fatalf("snapshot leaked credentials: %s", raw)
+	}
+}
+
+func TestSuppliedTokenRejectionIsReportedWithoutRefresh(t *testing.T) {
+	var usageCalls, tokenCalls atomic.Int32
+	fetcher, credentialsPath := suppliedTokenFetcher(t, func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/claude":
+			usageCalls.Add(1)
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+		case "/token":
+			tokenCalls.Add(1)
+			_, _ = w.Write([]byte(`{"access_token":"new-access","refresh_token":"new-refresh","expires_in":3600}`))
+		default:
+			http.NotFound(w, request)
+		}
+	})
+	before, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := fetcher.Snapshot(context.Background())
+	claude, _ := snapshot.Provider(ProviderIDClaude)
+	if !strings.Contains(claude.Error, "HTTP 401") || !strings.Contains(claude.Error, "supplied Claude OAuth token") {
+		t.Fatalf("Claude error = %q", claude.Error)
+	}
+	if strings.Contains(claude.Error, "secret") {
+		t.Fatalf("Claude error leaked the token: %q", claude.Error)
+	}
+	if len(claude.Windows) != 0 || claude.Stale {
+		t.Fatalf("Claude = %+v", claude)
+	}
+	if got := usageCalls.Load(); got != 1 {
+		t.Fatalf("usage calls = %d, want 1 (no retry)", got)
+	}
+	if got := tokenCalls.Load(); got != 0 {
+		t.Fatalf("token refresh calls = %d, want 0", got)
+	}
+	after, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatalf("supplied-token mode rewrote the credential file: %s", after)
+	}
+}
+
+func TestSuppliedTokenForbiddenIsReportedAsRejected(t *testing.T) {
+	fetcher, _ := suppliedTokenFetcher(t, func(w http.ResponseWriter, request *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	_, err := fetcher.fetchClaude(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "HTTP 403") || !strings.Contains(err.Error(), "supplied Claude OAuth token") {
+		t.Fatalf("Claude error = %v", err)
+	}
+}
+
+func TestNoClaudeCredentialStoreWithoutTokenReportsConfigError(t *testing.T) {
+	var claudeRequests atomic.Int32
+	fetcher, credentialsPath := suppliedTokenFetcher(t, func(w http.ResponseWriter, request *http.Request) {
+		claudeRequests.Add(1)
+		http.NotFound(w, request)
+	})
+	fetcher.claudeSuppliedToken = ""
+	fetcher.noClaudeStore = true
+	before, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := fetcher.Snapshot(context.Background())
+	claude, _ := snapshot.Provider(ProviderIDClaude)
+	if claude.Error != errClaudeTokenNotConfigured.Error() || len(claude.Windows) != 0 {
+		t.Fatalf("Claude = %+v", claude)
+	}
+	codex, _ := snapshot.Provider(ProviderIDCodex)
+	if codex.Error != "" || len(codex.Windows) != 2 {
+		t.Fatalf("Codex must still work: %+v", codex)
+	}
+	if got := claudeRequests.Load(); got != 0 {
+		t.Fatalf("Claude requests = %d, want 0", got)
+	}
+	after, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) || fetcher.claudeLoaded {
+		t.Fatal("credential store was touched with NoClaudeCredentialStore set")
+	}
+}
+
+func TestConfigClaudeOAuthTokenTrimsWhitespace(t *testing.T) {
+	fetcher := NewWithConfig(Config{HomeDir: t.TempDir(), ClaudeOAuthToken: "  supplied-secret\n"})
+	if fetcher.claudeSuppliedToken != "supplied-secret" {
+		t.Fatalf("supplied token = %q", fetcher.claudeSuppliedToken)
+	}
+	if NewWithConfig(Config{HomeDir: t.TempDir(), ClaudeOAuthToken: " \n"}).claudeSuppliedToken != "" {
+		t.Fatal("blank token did not fall back to the credential store")
+	}
+	if !NewWithConfig(Config{HomeDir: t.TempDir(), NoClaudeCredentialStore: true}).noClaudeStore {
+		t.Fatal("NoClaudeCredentialStore was not applied")
+	}
+}
+
+func TestDefaultModeStillReadsKeychain(t *testing.T) {
+	var keychainReads atomic.Int32
+	fetcher, _, _ := testFetcher(t, func(w http.ResponseWriter, request *http.Request) {
+		if got := request.Header.Get("Authorization"); got != "Bearer claude-secret" {
+			t.Errorf("Claude Authorization = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":8,"resets_at":"2026-08-05T19:40:00Z"}}`))
+	})
+	fetcher.run = func(_ context.Context, input []byte, name string, args ...string) ([]byte, error) {
+		if input != nil || name != "/usr/bin/security" || len(args) < 4 || args[0] != "find-generic-password" || args[2] != claudeKeychainItem {
+			t.Errorf("Keychain read command = %s %v", name, args)
+		}
+		keychainReads.Add(1)
+		return []byte(`{"claudeAiOauth":{"accessToken":"claude-secret"}}`), nil
+	}
+	windows, err := fetcher.fetchClaude(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(windows) != 1 {
+		t.Fatalf("Claude windows = %+v", windows)
+	}
+	if got := keychainReads.Load(); got != 1 {
+		t.Fatalf("Keychain reads = %d, want 1", got)
+	}
+}
+
 func decodeKeychainUpdate(t *testing.T, input []byte) []byte {
 	t.Helper()
 	const marker = ` -X "`

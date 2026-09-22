@@ -139,6 +139,20 @@ in the application. Golden images in `png/testdata` pin the output;
   refreshes OAuth tokens before expiry, retries HTTP 401 once, and persists
   rotations. When a save fails, the module keeps the rotated credential in
   memory and tries the save again on the next poll.
+- A caller can supply its own Claude OAuth token instead, for example the
+  long-lived token from `claude setup-token`:
+
+  ```go
+  usage := agentusage.NewWithConfig(agentusage.Config{
+      ClaudeOAuthToken: os.Getenv("CLAUDE_CODE_OAUTH_TOKEN"),
+  })
+  ```
+
+  In this mode the module never reads or writes the credential file or the
+  Keychain item, and it never refreshes the token. The token is the caller's
+  to manage. A rejected token shows as a sanitized provider error.
+  `NoClaudeCredentialStore: true` turns off the store fallback as well, so
+  a missing token shows as a configuration error instead of a Keychain read.
 
 ## JSON contract
 

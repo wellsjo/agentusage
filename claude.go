@@ -25,27 +25,67 @@ const (
 )
 
 func (f *Fetcher) fetchClaude(ctx context.Context) ([]Window, error) {
-	token, err := f.claudeToken(ctx, "")
+	var payload claudeUsage
+	var err error
+	switch {
+	case f.claudeSuppliedToken != "":
+		payload, err = f.fetchClaudeUsageWithSuppliedToken(ctx)
+	case f.noClaudeStore:
+		err = errClaudeTokenNotConfigured
+	default:
+		payload, err = f.fetchClaudeUsageFromStore(ctx)
+	}
 	if err != nil {
 		return nil, err
-	}
-	payload, err := f.fetchClaudeUsage(ctx, token)
-	var statusErr *httpStatusError
-	if errors.As(err, &statusErr) && statusErr.Code == http.StatusUnauthorized {
-		token, err = f.claudeToken(ctx, token)
-		if err != nil {
-			return nil, fmt.Errorf("Claude usage returned HTTP 401 and token refresh failed: %w", err)
-		}
-		payload, err = f.fetchClaudeUsage(ctx, token)
-	}
-	if err != nil {
-		return nil, fmt.Errorf("Claude usage: %w", err)
 	}
 	windows := claudeWindows(payload)
 	if len(windows) == 0 {
 		return nil, fmt.Errorf("Claude returned no usage windows")
 	}
 	return windows, nil
+}
+
+// errClaudeTokenNotConfigured is the Claude provider error when the caller
+// turned off the credential store and supplied no token.
+var errClaudeTokenNotConfigured = errors.New("Claude OAuth token is not configured")
+
+// fetchClaudeUsageWithSuppliedToken uses the caller-supplied token as is.
+// The token is the caller's to manage: a `claude setup-token` token is
+// long-lived and is not meant for third-party refresh. So this path never
+// refreshes, never retries a 401, and never touches a credential store. A
+// rejected token becomes a clear provider error instead.
+func (f *Fetcher) fetchClaudeUsageWithSuppliedToken(ctx context.Context) (claudeUsage, error) {
+	payload, err := f.fetchClaudeUsage(ctx, f.claudeSuppliedToken)
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) && (statusErr.Code == http.StatusUnauthorized || statusErr.Code == http.StatusForbidden) {
+		return claudeUsage{}, fmt.Errorf("Claude usage: HTTP %d; the supplied Claude OAuth token was rejected (run `claude setup-token` for a new one)", statusErr.Code)
+	}
+	if err != nil {
+		return claudeUsage{}, fmt.Errorf("Claude usage: %w", err)
+	}
+	return payload, nil
+}
+
+// fetchClaudeUsageFromStore reads the Claude Code credential store, refreshes
+// an expired token, and retries one HTTP 401 with a refreshed token.
+func (f *Fetcher) fetchClaudeUsageFromStore(ctx context.Context) (claudeUsage, error) {
+	token, err := f.claudeToken(ctx, "")
+	if err != nil {
+		return claudeUsage{}, err
+	}
+	payload, err := f.fetchClaudeUsage(ctx, token)
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) && statusErr.Code == http.StatusUnauthorized {
+		token, err = f.claudeToken(ctx, token)
+		if err != nil {
+			return claudeUsage{}, fmt.Errorf("Claude usage returned HTTP 401 and token refresh failed: %w", err)
+		}
+		payload, err = f.fetchClaudeUsage(ctx, token)
+	}
+	if err != nil {
+		return claudeUsage{}, fmt.Errorf("Claude usage: %w", err)
+	}
+	return payload, nil
 }
 
 func (f *Fetcher) fetchClaudeUsage(ctx context.Context, token string) (claudeUsage, error) {

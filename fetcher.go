@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"strings"
 	"sync"
 	"time"
 )
@@ -28,6 +29,17 @@ type Config struct {
 	HomeDir      string
 	CodexHome    string
 	CodexCommand string
+
+	// ClaudeOAuthToken is a Claude OAuth access token that the caller owns,
+	// for example the long-lived token that `claude setup-token` prints. When
+	// it is set, the Claude provider uses this token as is: it never reads or
+	// writes the Claude Code credential file or the macOS Keychain item, and it
+	// never refreshes the token. A rejected token surfaces as a provider error.
+	ClaudeOAuthToken string
+	// NoClaudeCredentialStore turns off the Claude Code credential file and
+	// Keychain fallback. With it set and no ClaudeOAuthToken, the Claude
+	// provider reports a configuration error instead of reading a store.
+	NoClaudeCredentialStore bool
 }
 
 type commandRunner func(context.Context, []byte, string, ...string) ([]byte, error)
@@ -59,6 +71,11 @@ type Fetcher struct {
 	claudeURL      string
 	tokenURL       string
 	username       string
+	// claudeSuppliedToken is Config.ClaudeOAuthToken. A non-empty value turns
+	// off every credential store read, write, and refresh for Claude.
+	claudeSuppliedToken string
+	// noClaudeStore is Config.NoClaudeCredentialStore.
+	noClaudeStore bool
 
 	// credMu guards the in-memory copy of the Claude credentials.
 	credMu       sync.Mutex
@@ -111,15 +128,17 @@ func NewWithConfig(config Config) *Fetcher {
 		startCodex: func(ctx context.Context) *exec.Cmd {
 			return exec.CommandContext(ctx, codexCommand, "app-server")
 		},
-		client:         client,
-		run:            outputCommand,
-		now:            time.Now,
-		cacheTTL:       cacheTTL,
-		requestTimeout: defaultRequestTimeout,
-		claudeURL:      claudeUsageURL,
-		tokenURL:       claudeTokenURL,
-		username:       username,
-		retryAt:        make(map[string]time.Time),
+		client:              client,
+		run:                 outputCommand,
+		now:                 time.Now,
+		cacheTTL:            cacheTTL,
+		requestTimeout:      defaultRequestTimeout,
+		claudeURL:           claudeUsageURL,
+		tokenURL:            claudeTokenURL,
+		username:            username,
+		claudeSuppliedToken: strings.TrimSpace(config.ClaudeOAuthToken),
+		noClaudeStore:       config.NoClaudeCredentialStore,
+		retryAt:             make(map[string]time.Time),
 	}
 }
 
