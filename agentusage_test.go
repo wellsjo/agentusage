@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -691,6 +692,295 @@ func TestNoClaudeCredentialStoreWithoutTokenReportsConfigError(t *testing.T) {
 	}
 	if string(before) != string(after) || fetcher.claudeLoaded {
 		t.Fatal("credential store was touched with NoClaudeCredentialStore set")
+	}
+}
+
+// readOnlyStoreFetcher builds a Fetcher in read-only store mode. Its Keychain
+// stub serves the current value of stored on every read, and it fails the
+// test on any command with input (so any Keychain write). The token endpoint
+// fails the test too: read-only mode never refreshes.
+func readOnlyStoreFetcher(t *testing.T, stored *[]byte, usage http.HandlerFunc) (*Fetcher, *atomic.Int32, *atomic.Int32) {
+	t.Helper()
+	var usageCalls, keychainReads atomic.Int32
+	fetcher, _, _ := testFetcher(t, func(w http.ResponseWriter, request *http.Request) {
+		switch request.URL.Path {
+		case "/claude":
+			usageCalls.Add(1)
+			usage(w, request)
+		case "/token":
+			t.Error("read-only store mode refreshed the token")
+			http.Error(w, "unexpected refresh", http.StatusInternalServerError)
+		default:
+			http.NotFound(w, request)
+		}
+	})
+	fetcher.readOnlyClaudeStore = true
+	fetcher.username = "test-user"
+	fetcher.run = func(_ context.Context, input []byte, name string, args ...string) ([]byte, error) {
+		if input != nil {
+			t.Fatalf("read-only store mode wrote to the Keychain: %s %v", name, args)
+		}
+		if name != "/usr/bin/security" || len(args) < 4 || args[0] != "find-generic-password" || args[2] != claudeKeychainItem {
+			t.Errorf("Keychain read command = %s %v", name, args)
+		}
+		keychainReads.Add(1)
+		return *stored, nil
+	}
+	return fetcher, &usageCalls, &keychainReads
+}
+
+func TestReadOnlyStoreReadsKeychainAndUsesStoredToken(t *testing.T) {
+	stored := []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"stored-secret","refreshToken":"stored-refresh","expiresAt":%d,"subscriptionType":"max"}}`, testNow.Add(time.Hour).UnixMilli()))
+	fetcher, usageCalls, keychainReads := readOnlyStoreFetcher(t, &stored, func(w http.ResponseWriter, request *http.Request) {
+		if got := request.Header.Get("Authorization"); got != "Bearer stored-secret" {
+			t.Errorf("Claude Authorization = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":8,"resets_at":"2026-08-05T19:40:00Z"}}`))
+	})
+	snapshot := fetcher.Snapshot(context.Background())
+	claude, ok := snapshot.Provider(ProviderIDClaude)
+	if !ok || claude.Error != "" || len(claude.Windows) != 1 {
+		t.Fatalf("Claude = %+v", claude)
+	}
+	if got := usageCalls.Load(); got != 1 {
+		t.Fatalf("usage calls = %d, want 1", got)
+	}
+	if got := keychainReads.Load(); got != 1 {
+		t.Fatalf("Keychain reads = %d, want 1", got)
+	}
+	if !fetcher.claudeLoaded || fetcher.claudeDirty {
+		t.Fatalf("read-only state: loaded=%v dirty=%v", fetcher.claudeLoaded, fetcher.claudeDirty)
+	}
+	raw, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "secret") {
+		t.Fatalf("snapshot leaked credentials: %s", raw)
+	}
+}
+
+// A token that is within the default refresh margin but not yet expired is
+// still used: read-only mode cannot refresh early, so it must not fail early.
+func TestReadOnlyStoreUsesTokenInsideRefreshMargin(t *testing.T) {
+	stored := []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"stored-secret","refreshToken":"stored-refresh","expiresAt":%d}}`, testNow.Add(time.Minute).UnixMilli()))
+	fetcher, usageCalls, _ := readOnlyStoreFetcher(t, &stored, func(w http.ResponseWriter, request *http.Request) {
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":8,"resets_at":"2026-08-05T19:40:00Z"}}`))
+	})
+	if _, err := fetcher.fetchClaude(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := usageCalls.Load(); got != 1 {
+		t.Fatalf("usage calls = %d, want 1", got)
+	}
+}
+
+func TestReadOnlyStoreDoesNotRefreshExpiredToken(t *testing.T) {
+	stored := []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"expired-secret","refreshToken":"stored-refresh","expiresAt":%d}}`, testNow.Add(-time.Hour).UnixMilli()))
+	fetcher, usageCalls, _ := readOnlyStoreFetcher(t, &stored, func(w http.ResponseWriter, request *http.Request) {
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	})
+	_, err := fetcher.fetchClaude(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "expired") || !strings.Contains(err.Error(), claudeLoginHint) {
+		t.Fatalf("Claude error = %v", err)
+	}
+	if strings.Contains(err.Error(), "secret") {
+		t.Fatalf("Claude error leaked the token: %v", err)
+	}
+	if got := usageCalls.Load(); got != 0 {
+		t.Fatalf("usage calls = %d, want 0", got)
+	}
+	if fetcher.claudeDirty {
+		t.Fatal("read-only mode marked credentials dirty")
+	}
+}
+
+// The Keychain record that a broken writer leaves behind: every field is
+// present, but both tokens are empty strings. The provider degrades to a
+// login hint, sends no request, and writes nothing.
+func TestReadOnlyStoreBlankRecordAsksForLogin(t *testing.T) {
+	stored := []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"","refreshToken":"","expiresAt":%d,"refreshTokenExpiresAt":%d,"scopes":["user:inference"],"subscriptionType":"max"}}`, testNow.Add(-time.Hour).UnixMilli(), testNow.Add(24*time.Hour).UnixMilli()))
+	fetcher, usageCalls, keychainReads := readOnlyStoreFetcher(t, &stored, func(w http.ResponseWriter, request *http.Request) {
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	})
+	snapshot := fetcher.Snapshot(context.Background())
+	claude, _ := snapshot.Provider(ProviderIDClaude)
+	if !strings.Contains(claude.Error, "incomplete") || !strings.Contains(claude.Error, claudeLoginHint) {
+		t.Fatalf("Claude error = %q", claude.Error)
+	}
+	if len(claude.Windows) != 0 || claude.Stale {
+		t.Fatalf("Claude = %+v", claude)
+	}
+	codex, _ := snapshot.Provider(ProviderIDCodex)
+	if codex.Error != "" || len(codex.Windows) != 2 {
+		t.Fatalf("Codex must still work: %+v", codex)
+	}
+	if got := usageCalls.Load(); got != 0 {
+		t.Fatalf("usage calls = %d, want 0", got)
+	}
+	if got := keychainReads.Load(); got != 1 {
+		t.Fatalf("Keychain reads = %d, want 1", got)
+	}
+	if fetcher.claudeLoaded || fetcher.claudeDirty {
+		t.Fatalf("blank record was adopted: loaded=%v dirty=%v", fetcher.claudeLoaded, fetcher.claudeDirty)
+	}
+}
+
+func TestReadOnlyStoreMissingRecordAsksForLogin(t *testing.T) {
+	fetcher, usageCalls, _ := readOnlyStoreFetcher(t, new([]byte), func(w http.ResponseWriter, request *http.Request) {
+		http.Error(w, "unexpected", http.StatusInternalServerError)
+	})
+	fetcher.run = func(context.Context, []byte, string, ...string) ([]byte, error) {
+		return nil, fmt.Errorf("security: SecKeychainSearchCopyNext: The specified item could not be found in the keychain")
+	}
+	_, err := fetcher.fetchClaude(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "not found") || !strings.Contains(err.Error(), claudeLoginHint) {
+		t.Fatalf("Claude error = %v", err)
+	}
+	if got := usageCalls.Load(); got != 0 {
+		t.Fatalf("usage calls = %d, want 0", got)
+	}
+}
+
+// HTTP 401 re-reads the store once. When the CLI rotated the record in the
+// meantime, the new token serves the retry; nothing is refreshed or written.
+func TestReadOnlyStoreRetriesOnceWithRotatedStore(t *testing.T) {
+	stored := []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"revoked-secret","refreshToken":"old-refresh","expiresAt":%d}}`, testNow.Add(time.Hour).UnixMilli()))
+	rotated := []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"rotated-secret","refreshToken":"rotated-refresh","expiresAt":%d}}`, testNow.Add(2*time.Hour).UnixMilli()))
+	fetcher, usageCalls, keychainReads := readOnlyStoreFetcher(t, &stored, func(w http.ResponseWriter, request *http.Request) {
+		if request.Header.Get("Authorization") == "Bearer revoked-secret" {
+			stored = rotated
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if got := request.Header.Get("Authorization"); got != "Bearer rotated-secret" {
+			t.Errorf("Claude Authorization = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":8,"resets_at":"2026-08-05T19:40:00Z"}}`))
+	})
+	windows, err := fetcher.fetchClaude(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(windows) != 1 {
+		t.Fatalf("Claude windows = %+v", windows)
+	}
+	if got := usageCalls.Load(); got != 2 {
+		t.Fatalf("usage calls = %d, want one 401 and one retry", got)
+	}
+	if got := keychainReads.Load(); got != 2 {
+		t.Fatalf("Keychain reads = %d, want 2", got)
+	}
+	if fetcher.claudeAuth.AccessToken != "rotated-secret" || fetcher.claudeDirty {
+		t.Fatalf("in-memory credentials after rotation = %q dirty=%v", fetcher.claudeAuth.AccessToken, fetcher.claudeDirty)
+	}
+}
+
+// HTTP 401 with an unchanged store, and HTTP 403 on any token, both end in a
+// login hint with no refresh and no write.
+func TestReadOnlyStoreRejectedTokenAsksForLogin(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		stored := []byte(fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"stored-secret","refreshToken":"stored-refresh","expiresAt":%d}}`, testNow.Add(time.Hour).UnixMilli()))
+		fetcher, usageCalls, _ := readOnlyStoreFetcher(t, &stored, func(w http.ResponseWriter, request *http.Request) {
+			http.Error(w, "rejected", status)
+		})
+		_, err := fetcher.fetchClaude(context.Background())
+		if err == nil || !strings.Contains(err.Error(), fmt.Sprintf("HTTP %d", status)) || !strings.Contains(err.Error(), claudeLoginHint) {
+			t.Fatalf("HTTP %d: Claude error = %v", status, err)
+		}
+		if strings.Contains(err.Error(), "secret") {
+			t.Fatalf("Claude error leaked the token: %v", err)
+		}
+		if got := usageCalls.Load(); got != 1 {
+			t.Fatalf("HTTP %d: usage calls = %d, want 1 (no retry with the same token)", status, got)
+		}
+	}
+}
+
+// The credential file fallback stays byte-identical across a successful
+// fetch, a rejection, and a forced dirty save. The save path itself refuses
+// to write in read-only mode, so even a caller bug cannot reach the store.
+func TestReadOnlyStoreNeverWritesCredentialFile(t *testing.T) {
+	fetcher, _, _ := readOnlyStoreFetcher(t, new([]byte), func(w http.ResponseWriter, request *http.Request) {
+		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	})
+	fetcher.run = func(_ context.Context, _ []byte, name string, args ...string) ([]byte, error) {
+		t.Fatalf("credential file mode ran a command: %s %v", name, args)
+		return nil, nil
+	}
+	credentialsDir := filepath.Join(fetcher.homeDir, ".claude")
+	if err := os.MkdirAll(credentialsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	credentialsPath := filepath.Join(credentialsDir, ".credentials.json")
+	planted := fmt.Sprintf(`{"claudeAiOauth":{"accessToken":"stored-secret","refreshToken":"stored-refresh","expiresAt":%d}}`, testNow.Add(time.Hour).UnixMilli())
+	if err := os.WriteFile(credentialsPath, []byte(planted), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := fetcher.fetchClaude(context.Background()); err == nil {
+		t.Fatal("rejected token did not fail")
+	}
+	// Simulate a rotation that a caller bug marked for persistence.
+	fetcher.credMu.Lock()
+	fetcher.claudeDirty = true
+	fetcher.saveDirtyCredentials(context.Background())
+	dirty := fetcher.claudeDirty
+	fetcher.credMu.Unlock()
+	if !dirty {
+		t.Fatal("read-only mode reported a successful save")
+	}
+	if err := fetcher.saveClaudeCredentials(context.Background(), "", []byte("{}")); !errors.Is(err, errClaudeStoreReadOnly) {
+		t.Fatalf("Keychain save in read-only mode = %v, want %v", err, errClaudeStoreReadOnly)
+	}
+
+	after, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != planted {
+		t.Fatalf("read-only mode rewrote the credential file: %s", after)
+	}
+	entries, err := os.ReadDir(credentialsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("read-only mode wrote extra files: %v", entries)
+	}
+}
+
+// A supplied token wins over read-only store mode, and read-only mode is
+// off unless the caller asks for it.
+func TestReadOnlyStoreConfigPrecedence(t *testing.T) {
+	fetcher := NewWithConfig(Config{HomeDir: t.TempDir(), ReadOnlyClaudeCredentialStore: true})
+	if !fetcher.readOnlyClaudeStore {
+		t.Fatal("ReadOnlyClaudeCredentialStore was not applied")
+	}
+	if NewWithConfig(Config{HomeDir: t.TempDir()}).readOnlyClaudeStore {
+		t.Fatal("read-only mode is on by default")
+	}
+
+	supplied, credentialsPath := suppliedTokenFetcher(t, func(w http.ResponseWriter, request *http.Request) {
+		if got := request.Header.Get("Authorization"); got != "Bearer supplied-secret" {
+			t.Errorf("Claude Authorization = %q", got)
+		}
+		_, _ = w.Write([]byte(`{"five_hour":{"utilization":8,"resets_at":"2026-08-05T19:40:00Z"}}`))
+	})
+	supplied.readOnlyClaudeStore = true
+	before, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := supplied.fetchClaude(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) || supplied.claudeLoaded {
+		t.Fatal("supplied token with read-only mode touched the credential store")
 	}
 }
 

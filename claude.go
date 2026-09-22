@@ -32,6 +32,8 @@ func (f *Fetcher) fetchClaude(ctx context.Context) ([]Window, error) {
 		payload, err = f.fetchClaudeUsageWithSuppliedToken(ctx)
 	case f.noClaudeStore:
 		err = errClaudeTokenNotConfigured
+	case f.readOnlyClaudeStore:
+		payload, err = f.fetchClaudeUsageFromReadOnlyStore(ctx)
 	default:
 		payload, err = f.fetchClaudeUsageFromStore(ctx)
 	}
@@ -49,6 +51,10 @@ func (f *Fetcher) fetchClaude(ctx context.Context) ([]Window, error) {
 // turned off the credential store and supplied no token.
 var errClaudeTokenNotConfigured = errors.New("Claude OAuth token is not configured")
 
+// errClaudeStoreReadOnly guards the save path in read-only mode. The
+// read-only fetch path never reaches a save; this is a second lock.
+var errClaudeStoreReadOnly = errors.New("Claude credential store is read-only")
+
 // fetchClaudeUsageWithSuppliedToken uses the caller-supplied token as is.
 // The token is the caller's to manage: a `claude setup-token` token is
 // long-lived and is not meant for third-party refresh. So this path never
@@ -64,6 +70,79 @@ func (f *Fetcher) fetchClaudeUsageWithSuppliedToken(ctx context.Context) (claude
 		return claudeUsage{}, fmt.Errorf("Claude usage: %w", err)
 	}
 	return payload, nil
+}
+
+// claudeLoginHint is the fix for every read-only store failure: the Claude
+// Code CLI owns the credential, so a login there repairs the store.
+const claudeLoginHint = "run `claude` and log in"
+
+// fetchClaudeUsageFromReadOnlyStore reads the Claude Code credential store
+// and uses its access token as is. It never refreshes the token and never
+// writes the store: a refresh can rotate the refresh token on the server, and
+// a rotation that the Claude Code CLI never learns about signs the CLI out.
+// The CLI refreshes its own record whenever it runs. An expired token, a
+// blank record, or a rejected token shows as a provider error that asks for a
+// `claude` login. HTTP 401 retries once with the stored token, in case the
+// CLI rotated the record after the first read.
+func (f *Fetcher) fetchClaudeUsageFromReadOnlyStore(ctx context.Context) (claudeUsage, error) {
+	token, err := f.claudeStoredToken(ctx, "")
+	if err != nil {
+		return claudeUsage{}, err
+	}
+	payload, err := f.fetchClaudeUsage(ctx, token)
+	var statusErr *httpStatusError
+	if errors.As(err, &statusErr) && statusErr.Code == http.StatusUnauthorized {
+		token, err = f.claudeStoredToken(ctx, token)
+		if err != nil {
+			return claudeUsage{}, fmt.Errorf("Claude usage returned HTTP 401: %w", err)
+		}
+		payload, err = f.fetchClaudeUsage(ctx, token)
+	}
+	if errors.As(err, &statusErr) && (statusErr.Code == http.StatusUnauthorized || statusErr.Code == http.StatusForbidden) {
+		return claudeUsage{}, fmt.Errorf("Claude usage: HTTP %d; the stored Claude Code credential was rejected (%s)", statusErr.Code, claudeLoginHint)
+	}
+	if err != nil {
+		return claudeUsage{}, fmt.Errorf("Claude usage: %w", err)
+	}
+	return payload, nil
+}
+
+// claudeStoredToken returns the stored access token for read-only mode. It
+// reads the store when the in-memory copy is missing, rejected, or expired,
+// and it never refreshes or writes. rejectedToken names a token that the API
+// rejected; the function never returns that token again.
+func (f *Fetcher) claudeStoredToken(ctx context.Context, rejectedToken string) (string, error) {
+	f.credMu.Lock()
+	defer f.credMu.Unlock()
+
+	if f.claudeLoaded && f.claudeAuth.AccessToken != rejectedToken && f.claudeTokenUnexpired(f.claudeAuth) {
+		return f.claudeAuth.AccessToken, nil
+	}
+	stored, path, err := f.loadClaudeCredentials(ctx)
+	if err != nil {
+		return "", fmt.Errorf("%w (%s)", err, claudeLoginHint)
+	}
+	f.claudePath = path
+	f.claudeAuth = stored
+	f.claudeLoaded = true
+	f.claudeDirty = false
+	if stored.AccessToken == rejectedToken {
+		return "", fmt.Errorf("the stored Claude Code credential was rejected (%s)", claudeLoginHint)
+	}
+	if !f.claudeTokenUnexpired(stored) {
+		return "", fmt.Errorf("the stored Claude Code access token has expired (%s)", claudeLoginHint)
+	}
+	return stored.AccessToken, nil
+}
+
+// claudeTokenUnexpired reports whether the token is present and not yet
+// expired. Unlike claudeTokenUsable it keeps no refresh margin, because
+// read-only mode cannot refresh.
+func (f *Fetcher) claudeTokenUnexpired(auth claudeCredentials) bool {
+	if auth.AccessToken == "" {
+		return false
+	}
+	return auth.ExpiresAt == 0 || auth.ExpiresAt > f.now().UnixMilli()
 }
 
 // fetchClaudeUsageFromStore reads the Claude Code credential store, refreshes
@@ -343,6 +422,9 @@ func (f *Fetcher) refreshClaudeToken(ctx context.Context, refreshToken string) (
 // saveClaudeCredentials writes the credential document to the given file
 // path, or to the macOS Keychain when the path is empty.
 func (f *Fetcher) saveClaudeCredentials(ctx context.Context, path string, raw []byte) error {
+	if f.readOnlyClaudeStore {
+		return errClaudeStoreReadOnly
+	}
 	if path != "" {
 		return writePrivateFile(path, raw)
 	}

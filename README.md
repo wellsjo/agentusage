@@ -153,6 +153,22 @@ in the application. Golden images in `png/testdata` pin the output;
   to manage. A rejected token shows as a sanitized provider error.
   `NoClaudeCredentialStore: true` turns off the store fallback as well, so
   a missing token shows as a configuration error instead of a Keychain read.
+- A caller that shares the Claude Code credential store with the CLI can
+  read it without ever changing it:
+
+  ```go
+  usage := agentusage.NewWithConfig(agentusage.Config{
+      ReadOnlyClaudeCredentialStore: true,
+  })
+  ```
+
+  In this mode the module reads the credential file or the Keychain item
+  exactly as the default mode does, but it never writes the store and never
+  refreshes the stored token. The Claude Code CLI stays the only owner of
+  the credential, so a refresh that the CLI never learns about cannot sign
+  it out. An expired token, a blank record, or a rejected token shows as a
+  provider error that asks for a `claude` login; the CLI refreshes its own
+  record whenever it runs, and the next poll reads the store again.
 
 ## JSON contract
 
