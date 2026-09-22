@@ -40,6 +40,14 @@ type Config struct {
 	// Keychain fallback. With it set and no ClaudeOAuthToken, the Claude
 	// provider reports a configuration error instead of reading a store.
 	NoClaudeCredentialStore bool
+	// ReadOnlyClaudeCredentialStore reads the Claude Code credential file or
+	// Keychain item exactly as the default mode does, but it never writes the
+	// store and never refreshes the stored token. The Claude Code CLI stays
+	// the only owner of that credential. An expired or rejected token shows as
+	// a provider error that asks for a `claude` login, and the next poll reads
+	// the store again. ClaudeOAuthToken and NoClaudeCredentialStore both take
+	// precedence over this setting.
+	ReadOnlyClaudeCredentialStore bool
 }
 
 type commandRunner func(context.Context, []byte, string, ...string) ([]byte, error)
@@ -76,6 +84,9 @@ type Fetcher struct {
 	claudeSuppliedToken string
 	// noClaudeStore is Config.NoClaudeCredentialStore.
 	noClaudeStore bool
+	// readOnlyClaudeStore is Config.ReadOnlyClaudeCredentialStore. It turns
+	// off every credential store write and every token refresh for Claude.
+	readOnlyClaudeStore bool
 
 	// credMu guards the in-memory copy of the Claude credentials.
 	credMu       sync.Mutex
@@ -138,6 +149,7 @@ func NewWithConfig(config Config) *Fetcher {
 		username:            username,
 		claudeSuppliedToken: strings.TrimSpace(config.ClaudeOAuthToken),
 		noClaudeStore:       config.NoClaudeCredentialStore,
+		readOnlyClaudeStore: config.ReadOnlyClaudeCredentialStore,
 		retryAt:             make(map[string]time.Time),
 	}
 }
