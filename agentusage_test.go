@@ -650,6 +650,50 @@ func TestSuppliedTokenRejectionIsReportedWithoutRefresh(t *testing.T) {
 	}
 }
 
+func TestSuppliedTokenForbiddenIsReportedAsRejected(t *testing.T) {
+	fetcher, _ := suppliedTokenFetcher(t, func(w http.ResponseWriter, request *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	})
+	_, err := fetcher.fetchClaude(context.Background())
+	if err == nil || !strings.Contains(err.Error(), "HTTP 403") || !strings.Contains(err.Error(), "supplied Claude OAuth token") {
+		t.Fatalf("Claude error = %v", err)
+	}
+}
+
+func TestNoClaudeCredentialStoreWithoutTokenReportsConfigError(t *testing.T) {
+	var claudeRequests atomic.Int32
+	fetcher, credentialsPath := suppliedTokenFetcher(t, func(w http.ResponseWriter, request *http.Request) {
+		claudeRequests.Add(1)
+		http.NotFound(w, request)
+	})
+	fetcher.claudeSuppliedToken = ""
+	fetcher.noClaudeStore = true
+	before, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	snapshot := fetcher.Snapshot(context.Background())
+	claude, _ := snapshot.Provider(ProviderIDClaude)
+	if claude.Error != errClaudeTokenNotConfigured.Error() || len(claude.Windows) != 0 {
+		t.Fatalf("Claude = %+v", claude)
+	}
+	codex, _ := snapshot.Provider(ProviderIDCodex)
+	if codex.Error != "" || len(codex.Windows) != 2 {
+		t.Fatalf("Codex must still work: %+v", codex)
+	}
+	if got := claudeRequests.Load(); got != 0 {
+		t.Fatalf("Claude requests = %d, want 0", got)
+	}
+	after, err := os.ReadFile(credentialsPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) || fetcher.claudeLoaded {
+		t.Fatal("credential store was touched with NoClaudeCredentialStore set")
+	}
+}
+
 func TestConfigClaudeOAuthTokenTrimsWhitespace(t *testing.T) {
 	fetcher := NewWithConfig(Config{HomeDir: t.TempDir(), ClaudeOAuthToken: "  supplied-secret\n"})
 	if fetcher.claudeSuppliedToken != "supplied-secret" {
@@ -657,6 +701,9 @@ func TestConfigClaudeOAuthTokenTrimsWhitespace(t *testing.T) {
 	}
 	if NewWithConfig(Config{HomeDir: t.TempDir(), ClaudeOAuthToken: " \n"}).claudeSuppliedToken != "" {
 		t.Fatal("blank token did not fall back to the credential store")
+	}
+	if !NewWithConfig(Config{HomeDir: t.TempDir(), NoClaudeCredentialStore: true}).noClaudeStore {
+		t.Fatal("NoClaudeCredentialStore was not applied")
 	}
 }
 

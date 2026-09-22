@@ -151,6 +151,8 @@ in the application. Golden images in `png/testdata` pin the output;
   In this mode the module never reads or writes the credential file or the
   Keychain item, and it never refreshes the token. The token is the caller's
   to manage. A rejected token shows as a sanitized provider error.
+  `NoClaudeCredentialStore: true` turns off the store fallback as well, so
+  a missing token shows as a configuration error instead of a Keychain read.
 
 ## JSON contract
 

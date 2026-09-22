@@ -36,6 +36,10 @@ type Config struct {
 	// writes the Claude Code credential file or the macOS Keychain item, and it
 	// never refreshes the token. A rejected token surfaces as a provider error.
 	ClaudeOAuthToken string
+	// NoClaudeCredentialStore turns off the Claude Code credential file and
+	// Keychain fallback. With it set and no ClaudeOAuthToken, the Claude
+	// provider reports a configuration error instead of reading a store.
+	NoClaudeCredentialStore bool
 }
 
 type commandRunner func(context.Context, []byte, string, ...string) ([]byte, error)
@@ -70,6 +74,8 @@ type Fetcher struct {
 	// claudeSuppliedToken is Config.ClaudeOAuthToken. A non-empty value turns
 	// off every credential store read, write, and refresh for Claude.
 	claudeSuppliedToken string
+	// noClaudeStore is Config.NoClaudeCredentialStore.
+	noClaudeStore bool
 
 	// credMu guards the in-memory copy of the Claude credentials.
 	credMu       sync.Mutex
@@ -131,6 +137,7 @@ func NewWithConfig(config Config) *Fetcher {
 		tokenURL:            claudeTokenURL,
 		username:            username,
 		claudeSuppliedToken: strings.TrimSpace(config.ClaudeOAuthToken),
+		noClaudeStore:       config.NoClaudeCredentialStore,
 		retryAt:             make(map[string]time.Time),
 	}
 }

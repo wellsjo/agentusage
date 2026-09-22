@@ -27,9 +27,12 @@ const (
 func (f *Fetcher) fetchClaude(ctx context.Context) ([]Window, error) {
 	var payload claudeUsage
 	var err error
-	if f.claudeSuppliedToken != "" {
+	switch {
+	case f.claudeSuppliedToken != "":
 		payload, err = f.fetchClaudeUsageWithSuppliedToken(ctx)
-	} else {
+	case f.noClaudeStore:
+		err = errClaudeTokenNotConfigured
+	default:
 		payload, err = f.fetchClaudeUsageFromStore(ctx)
 	}
 	if err != nil {
@@ -42,6 +45,10 @@ func (f *Fetcher) fetchClaude(ctx context.Context) ([]Window, error) {
 	return windows, nil
 }
 
+// errClaudeTokenNotConfigured is the Claude provider error when the caller
+// turned off the credential store and supplied no token.
+var errClaudeTokenNotConfigured = errors.New("Claude OAuth token is not configured")
+
 // fetchClaudeUsageWithSuppliedToken uses the caller-supplied token as is.
 // The token is the caller's to manage: a `claude setup-token` token is
 // long-lived and is not meant for third-party refresh. So this path never
@@ -50,8 +57,8 @@ func (f *Fetcher) fetchClaude(ctx context.Context) ([]Window, error) {
 func (f *Fetcher) fetchClaudeUsageWithSuppliedToken(ctx context.Context) (claudeUsage, error) {
 	payload, err := f.fetchClaudeUsage(ctx, f.claudeSuppliedToken)
 	var statusErr *httpStatusError
-	if errors.As(err, &statusErr) && statusErr.Code == http.StatusUnauthorized {
-		return claudeUsage{}, fmt.Errorf("Claude usage: HTTP 401; the supplied Claude OAuth token was rejected (run `claude setup-token` for a new one)")
+	if errors.As(err, &statusErr) && (statusErr.Code == http.StatusUnauthorized || statusErr.Code == http.StatusForbidden) {
+		return claudeUsage{}, fmt.Errorf("Claude usage: HTTP %d; the supplied Claude OAuth token was rejected (run `claude setup-token` for a new one)", statusErr.Code)
 	}
 	if err != nil {
 		return claudeUsage{}, fmt.Errorf("Claude usage: %w", err)
