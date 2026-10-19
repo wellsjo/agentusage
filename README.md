@@ -39,12 +39,12 @@ mux.Handle("/ai/usage", agentusage.Handler(usage))
 mux.Handle("/assets/agent-usage.js", agentusageweb.Handler())
 ```
 
-The fetcher caches a snapshot for two minutes. Concurrent calls share one
-refresh, and the refresh runs on a detached context with its own timeout. So
-a canceled request cannot block or poison other callers. A snapshot with no
-data at all expires after 15 seconds, so the module recovers quickly from a
-start-up failure. The module honors `Retry-After` on HTTP 429, with a cap of
-24 hours.
+The fetcher caches successful provider reads for two minutes. Failed providers
+retry after five seconds, including failures with stale data or a healthy peer;
+retrying one provider does not refetch or postpone the other provider. Concurrent
+calls share one refresh, which runs on a detached context with its own timeout,
+so a canceled request cannot block or poison other callers. Server `Retry-After`
+backoff still takes precedence over fast recovery, with a cap of 24 hours.
 
 ## Browser
 
@@ -61,9 +61,12 @@ Attributes:
 
 - `endpoint` — the JSON endpoint. The default is `/ai/usage`. An empty value
   turns the fetch off.
-- `refresh-ms` — the poll interval in milliseconds. The default is `120000`,
-  and the minimum is `10000`. A value of `0` turns the poll off. An invalid
-  value falls back to the default.
+- `refresh-ms` — the healthy poll interval in milliseconds. The default is
+  `120000`, and the minimum is `10000`. While an endpoint or provider error
+  is showing, the component retries five seconds after each completed request,
+  then resumes the healthy interval after recovery. Slow requests never overlap.
+  A value of `0` turns all automatic polling off. An invalid value falls back
+  to the default.
 
 The component pauses its poll while the tab is hidden. It polls once when the
 tab becomes visible again.
@@ -197,3 +200,15 @@ in the application. Golden images in `png/testdata` pin the output;
 `windows` is always an array. `fetched_at` appears only after one successful
 fetch for that provider. A failed refresh keeps the last good provider values
 with `stale: true` and a sanitized `error` string.
+
+## Tests
+
+```sh
+go test -race ./...
+go vet ./...
+node --test web/agent-usage.test.mjs
+```
+
+The browser scheduling tests use Node's built-in test runner and an isolated
+fake clock; no npm packages are required. Go recovery tests use a controlled
+clock and fixture credentials, never the user's live login.

@@ -185,6 +185,7 @@ export class AgentUsage extends HTMLElement {
   async refresh() {
     const endpoint = this.endpoint;
     if (!endpoint) return;
+    this._stopRefreshTimer();
     this._controller?.abort();
     const controller = new AbortController();
     this._controller = controller;
@@ -212,24 +213,34 @@ export class AgentUsage extends HTMLElement {
         detail: { error: this._error },
       }));
     } finally {
-      if (this._controller === controller) this._controller = null;
+      if (this._controller === controller) {
+        this._controller = null;
+        this._scheduleRefresh();
+      }
     }
   }
 
   _startTimers() {
     this._stopTimers();
-    const refreshMs = this.refreshMs;
-    if (refreshMs > 0 && this.endpoint && !this._manual) {
-      this._refreshTimer = setInterval(() => this._timedRefresh(), Math.max(10000, refreshMs));
-    }
+    this._scheduleRefresh();
     this._clockTimer = setInterval(() => {
       if (!document.hidden) this._render();
     }, 15000);
   }
 
   _stopRefreshTimer() {
-    clearInterval(this._refreshTimer);
+    clearTimeout(this._refreshTimer);
     this._refreshTimer = null;
+  }
+
+  // Retry errors quickly, but keep healthy polling slow. Schedule after the
+  // request completes so a slow request is never aborted by the next poll.
+  _scheduleRefresh() {
+    this._stopRefreshTimer();
+    if (!this._connected || this._manual || !this.endpoint || this.refreshMs <= 0) return;
+    const failed = this._error || this._snapshot?.providers?.some((provider) => provider.error || provider.stale);
+    const delay = failed ? 5000 : Math.max(10000, this.refreshMs);
+    this._refreshTimer = setTimeout(() => this._timedRefresh(), delay);
   }
 
   _stopTimers() {

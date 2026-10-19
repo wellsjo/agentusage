@@ -324,7 +324,7 @@ func TestSnapshotHonorsRetryAfter(t *testing.T) {
 	if got := claudeRequests.Load(); got != 1 {
 		t.Fatalf("Claude requests = %d, want retry suppression", got)
 	}
-	if !strings.Contains(second.Providers[1].Error, "provider rate limited") {
+	if second.Providers[1].Error != first.Providers[1].Error {
 		t.Fatalf("second Claude error = %q", second.Providers[1].Error)
 	}
 }

@@ -16,9 +16,8 @@ import (
 const (
 	defaultCacheTTL       = 2 * time.Minute
 	defaultRequestTimeout = 10 * time.Second
-	// errorCacheTTL caps how long a snapshot with no data at all is served.
-	// The short cap lets the module recover quickly from a start-up failure.
-	errorCacheTTL = 15 * time.Second
+	// Failed providers retry quickly without invalidating healthy providers.
+	errorCacheTTL = 5 * time.Second
 )
 
 // Config overrides host integration settings. Zero values use the local CLI
@@ -95,11 +94,10 @@ type Fetcher struct {
 	claudeLoaded bool
 	claudeDirty  bool
 
-	mu       sync.Mutex
-	cache    Snapshot
-	cachedAt time.Time
-	retryAt  map[string]time.Time
-	refresh  chan struct{}
+	mu        sync.Mutex
+	cache     Snapshot
+	nextFetch map[string]time.Time
+	refresh   chan struct{}
 }
 
 // New creates a Fetcher for the current operating-system user.
@@ -150,7 +148,7 @@ func NewWithConfig(config Config) *Fetcher {
 		claudeSuppliedToken: strings.TrimSpace(config.ClaudeOAuthToken),
 		noClaudeStore:       config.NoClaudeCredentialStore,
 		readOnlyClaudeStore: config.ReadOnlyClaudeCredentialStore,
-		retryAt:             make(map[string]time.Time),
+		nextFetch:           make(map[string]time.Time),
 	}
 }
 
@@ -195,17 +193,17 @@ func (f *Fetcher) Snapshot(ctx context.Context) Snapshot {
 // cacheFresh reports whether the cache can serve the current request. The
 // caller must hold f.mu.
 func (f *Fetcher) cacheFresh() bool {
-	if f.cachedAt.IsZero() {
-		return false
+	now := f.now()
+	for _, spec := range providerSpecs {
+		if !now.Before(f.nextFetch[spec.id]) {
+			return false
+		}
 	}
-	ttl := f.cacheTTL
-	if !f.cache.HasData() {
-		ttl = min(ttl, errorCacheTTL)
-	}
-	return f.now().Sub(f.cachedAt) < ttl
+	return true
 }
 
-// runRefresh fetches every provider once and replaces the cache. It closes
+// runRefresh fetches only due providers and keeps the other cached results.
+// Retry deadlines are independent, including server-requested backoff. It closes
 // done so that all callers that wait on this refresh continue.
 func (f *Fetcher) runRefresh(ctx context.Context, done chan struct{}) {
 	f.mu.Lock()
@@ -214,21 +212,23 @@ func (f *Fetcher) runRefresh(ctx context.Context, done chan struct{}) {
 	for _, provider := range f.cache.Providers {
 		previous[provider.ID] = provider
 	}
-	blocked := make(map[string]time.Time, len(f.retryAt))
-	for id, at := range f.retryAt {
-		blocked[id] = at
+	nextFetch := make(map[string]time.Time, len(f.nextFetch))
+	for id, at := range f.nextFetch {
+		nextFetch[id] = at
 	}
 	f.mu.Unlock()
 
 	type result struct {
-		windows []Window
-		err     error
+		windows    []Window
+		err        error
+		cached     bool
+		finishedAt time.Time
 	}
 	results := make([]result, len(providerSpecs))
 	var group sync.WaitGroup
 	for i, spec := range providerSpecs {
-		if until := blocked[spec.id]; now.Before(until) {
-			results[i] = result{err: retryBlocked(until, now)}
+		if now.Before(nextFetch[spec.id]) {
+			results[i] = result{cached: true}
 			continue
 		}
 		group.Add(1)
@@ -237,7 +237,7 @@ func (f *Fetcher) runRefresh(ctx context.Context, done chan struct{}) {
 			fetchCtx, cancel := context.WithTimeout(ctx, f.requestTimeout)
 			defer cancel()
 			windows, err := spec.fetch(f, fetchCtx)
-			results[i] = result{windows: windows, err: err}
+			results[i] = result{windows: windows, err: err, finishedAt: f.now()}
 		}()
 	}
 	group.Wait()
@@ -248,18 +248,24 @@ func (f *Fetcher) runRefresh(ctx context.Context, done chan struct{}) {
 	for i, spec := range providerSpecs {
 		provider := Provider{ID: spec.id, Name: spec.name}
 		res := results[i]
+		if res.cached {
+			providers[i] = previous[spec.id]
+			continue
+		}
 		if res.err == nil {
 			fetchedAt := now
 			provider.Windows = res.windows
 			provider.FetchedAt = &fetchedAt
-			delete(f.retryAt, spec.id)
+			f.nextFetch[spec.id] = res.finishedAt.Add(f.cacheTTL)
 			providers[i] = provider
 			continue
 		}
+		delay := min(f.cacheTTL, errorCacheTTL)
 		var statusErr *httpStatusError
 		if errors.As(res.err, &statusErr) && statusErr.RetryAfter > 0 {
-			f.retryAt[spec.id] = now.Add(statusErr.RetryAfter)
+			delay = max(delay, statusErr.RetryAfter)
 		}
+		f.nextFetch[spec.id] = res.finishedAt.Add(delay)
 		if old, ok := previous[spec.id]; ok && len(old.Windows) > 0 {
 			old.Stale = true
 			old.Error = res.err.Error()
@@ -271,7 +277,6 @@ func (f *Fetcher) runRefresh(ctx context.Context, done chan struct{}) {
 		providers[i] = provider
 	}
 	f.cache = Snapshot{Providers: providers, UpdatedAt: now}
-	f.cachedAt = now
 	f.refresh = nil
 	close(done)
 }

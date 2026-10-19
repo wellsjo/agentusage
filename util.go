@@ -61,10 +61,6 @@ func parseRetryAfter(value string, now time.Time) time.Duration {
 	return 0
 }
 
-func retryBlocked(until, now time.Time) error {
-	return fmt.Errorf("provider rate limited (retry in %s)", until.Sub(now).Round(time.Second))
-}
-
 func windowLabel(seconds int64) string {
 	if seconds == weekSeconds {
 		return "1w window"
